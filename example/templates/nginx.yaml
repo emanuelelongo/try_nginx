@@ -10,29 +10,38 @@ data:
                        '"$http_x_cbt_bucket" "$http_host" "$http_accept"';
 
     access_log  /dev/stdout  main;
-    error_log   /dev/stderr warn;
+    error_log   /dev/stderr notice;
+
+    lua_shared_dict bucket_cache 10m;
+
+    init_by_lua_block {
+      package.path = "/etc/nginx/lua/?.lua;" .. package.path
+      require("script").load_buckets()
+    }
 
     upstream aws_upstream {
-        server minio-aws.default.svc.cluster.local:8080;
+      server minio-aws.default.svc.cluster.local:8080;
     }
 
     upstream witt_upstream {
-        server minio-witt.default.svc.cluster.local:8080;
+      server minio-witt.default.svc.cluster.local:8080;
     }
 
     server {
-        listen 80;
+      listen 80;
 
-        set $upstream "";
-        access_by_lua_file /etc/nginx/lua/script.lua;
+      set $upstream "";
+      access_by_lua_block {
+        require("script").select_upstream()
+      }
 
-        location / {
-            proxy_pass http://$upstream;
-            proxy_set_header Host $http_host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-        }
+      location / {
+        proxy_pass http://$upstream;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+      }
     }
 ---
 apiVersion: v1
@@ -41,19 +50,37 @@ metadata:
   name: lua-script
 data:
   script.lua: |
-    local file = io.open("/etc/nginx/conf.d/buckets.txt", "r")
-    local buckets = {}
-    for line in file:lines() do
-        buckets[line] = true
-    end
-    file:close()
+    local ngx_shared_cache = ngx.shared.bucket_cache
 
-    local bucket = ngx.var.http_x_cbt_bucket
-    local upstream = "aws_upstream"
-    if bucket and buckets[bucket] then
-        upstream = "witt_upstream"
+    local function load_buckets()
+      local file = io.open("/etc/nginx/conf.d/buckets.txt", "r")
+        if file then
+          ngx.log(ngx.NOTICE, "loading buckets into memory")
+          ngx_shared_cache:flush_all()
+          for line in file:lines() do
+            ngx_shared_cache:set(line, true)
+          end
+          file:close()
+        else
+          ngx.log(ngx.ERR, "Error: cannot open /etc/nginx/conf.d/buckets.txt")
+        end
     end
-    ngx.var.upstream = upstream
+
+    local function select_upstream()
+      local bucket = ngx.var.http_x_cbt_bucket
+      if bucket and ngx_shared_cache:get(bucket) then
+        ngx.log(ngx.NOTICE, "forwarding request to witt")
+        gx.var.upstream = "witt_upstream"
+      else
+        ngx.log(ngx.NOTICE, "forwarding request to aws")
+        ngx.var.upstream = "aws_upstream"
+      end
+    end
+
+    return {
+      load_buckets = load_buckets,
+      select_upstream = select_upstream
+    }
 ---
 apiVersion: v1
 kind: ConfigMap
