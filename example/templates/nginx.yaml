@@ -1,78 +1,76 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: nginx-config
+  name: nginx-conf
 data:
-  nginx.conf: |
-    worker_processes  1;
-    events {
-        worker_connections  1024;
+  default.conf: |
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                       '$status $body_bytes_sent "$http_referer" '
+                       '"$http_user_agent" "$http_x_forwarded_for" '
+                       '"$http_x_cbt_bucket" "$http_host" "$http_accept"';
+
+    access_log  /dev/stdout  main;
+    error_log   /dev/stderr warn;
+
+    upstream aws_upstream {
+        server minio-aws.default.svc.cluster.local:8080;
     }
-    http {
-      log_format debug '$remote_addr - $host - "$request" '
-                      'x-cbt-host="$http_x_cbt_host" '
-                      'bucket_name="$bucket_name" '
-                      'path_bucket="$path_bucket" '
-                      'final_bucket="$final_bucket" '
-                      'target_backend="$target_backend"';
 
-      access_log /dev/stdout debug;
-      error_log  /dev/stdout debug;
+    upstream witt_upstream {
+        server minio-witt.default.svc.cluster.local:8080;
+    }
 
-      upstream pizza_upstream {
-          server pizza.default.svc.cluster.local:80;
-      }
-      upstream sushi_upstream {
-          server sushi.default.svc.cluster.local:80;
-      }
+    server {
+        listen 80;
 
-      map $http_x_cbt_host $bucket_name {
-          default "";
-          ~^(?<bucket>[^.]+)\.s3\..*$ $bucket;
-      }
+        set $upstream "";
+        access_by_lua_file /etc/nginx/lua/script.lua;
 
-      map $request_uri $path_bucket {
-          default "";
-          ~^/([^/]+)/.*$ $1;
-      }
-
-      map $bucket_name $final_bucket {
-          default $path_bucket;
-          "" $path_bucket;  # If header is empty, use path
-          "~." $bucket_name; # If header has a valid bucket, use it
-      }
-
-      map $final_bucket $target_backend {
-          default "pizza_upstream";
-          include /etc/nginx/bucket_map.conf;
-      }
-
-      server {
-          listen 80;
-
-          location / {
-              proxy_pass http://$target_backend;
-              proxy_set_header Host $host;
-              proxy_set_header X-Real-IP $remote_addr;
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-          }
-      }
+        location / {
+            proxy_pass http://$upstream;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
     }
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: bucket-map
+  name: lua-script
 data:
-  bucket_map.conf: |
-    bucket1      pizza_upstream;
-    bucket2      pizza_upstream;
-    bucket3      sushi_upstream;
+  script.lua: |
+    local file = io.open("/etc/nginx/conf.d/buckets.txt", "r")
+    local buckets = {}
+    for line in file:lines() do
+        buckets[line] = true
+    end
+    file:close()
+
+    local bucket = ngx.var.http_x_cbt_bucket
+    local upstream = "aws_upstream"
+    if bucket and buckets[bucket] then
+        upstream = "witt_upstream"
+    end
+    ngx.var.upstream = upstream
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buckets
+  namespace: default
+data:
+  buckets: |
+    bucket1
+    bucket2
+    bucket3
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nginx
+  namespace: default
 spec:
   replicas: 1
   selector:
@@ -84,24 +82,31 @@ spec:
         app: nginx
     spec:
       volumes:
-      - name: nginx-config-volume
-        configMap:
-          name: nginx-config
-      - name: bucket-map-volume
-        configMap:
-          name: bucket-map
+        - name: config-volume
+          configMap:
+            name: buckets
+        - name: lua-script-volume
+          configMap:
+            name: lua-script
+        - name: nginx-conf-volume
+          configMap:
+            name: nginx-conf
       containers:
-      - name: nginx
-        image: nginx:latest
-        volumeMounts:
-        - name: nginx-config-volume
-          mountPath: /etc/nginx/nginx.conf
-          subPath: nginx.conf
-        - name: bucket-map-volume
-          mountPath: /etc/nginx/bucket_map.conf
-          subPath: bucket_map.conf
-        ports:
-        - containerPort: 80
+        - name: nginx
+          image: openresty/openresty:latest
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/nginx/conf.d/buckets.txt
+              subPath: buckets
+            - name: lua-script-volume
+              mountPath: /etc/nginx/lua/script.lua
+              subPath: script.lua
+            - name: nginx-conf-volume
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          ports:
+            - containerPort: 80
+          command: ["/bin/sh", "-c", "nginx -g 'daemon off;'"]
 ---
 apiVersion: v1
 kind: Service
@@ -112,6 +117,6 @@ spec:
     app: nginx
   ports:
     - protocol: TCP
-      port: 80
+      port: 8080
       targetPort: 80
   type: ClusterIP
